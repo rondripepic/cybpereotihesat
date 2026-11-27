@@ -297,8 +297,80 @@ if has systemctl; then systemctl list-unit-files --no-pager 2>/dev/null | grep -
 if has dpkg-query; then dpkg-query -W -f='${binary:Package} ${Version}\n' 2>/dev/null | grep -Ei '^(unattended-upgrades|apt-listchanges|needrestart)[[:space:]]' || true; fi
 echo "Check the challenge's update requirements before changing update services or settings."
 
-# 14. Human checklist
-section "[14] HUMAN REVIEW CHECKLIST"
+# 14. Actionable findings from observed Debian 12 image patterns
+section "[14] AUTOMATED FLAGS AND SUGGESTED HUMAN ACTIONS"
+echo "These checks identify conditions worth reviewing; they do not prove a scoring requirement."
+
+# /etc/shadow should not be readable by everyone or writable by its group.
+if [[ -e /etc/shadow ]]; then
+    shadow_mode="$(stat -c '%a' /etc/shadow 2>/dev/null || echo unknown)"
+    shadow_owner="$(stat -c '%U:%G' /etc/shadow 2>/dev/null || echo unknown)"
+    if [[ "$shadow_mode" =~ ^[0-7]{3,4}$ ]]; then
+        # Evaluate permission bits without assuming a single distro-specific mode.
+        shadow_num=$((8#$shadow_mode))
+        if (( (shadow_num & 0004) != 0 || (shadow_num & 0020) != 0 || (shadow_num & 0002) != 0 )); then
+            check "/etc/shadow has overly broad permissions ($shadow_mode, $shadow_owner)."
+            echo "  Review the challenge requirements. Common Debian target: sudo chmod 640 /etc/shadow"
+            echo "  Owner/group are currently: $shadow_owner; verify before changing ownership."
+        else
+            ok "/etc/shadow does not appear world-readable or group/world-writable ($shadow_mode, $shadow_owner)."
+        fi
+    else
+        review "Could not parse /etc/shadow permissions: $shadow_mode"
+    fi
+fi
+
+# Kernel settings: present candidate values, not automatic fixes.
+if has sysctl; then
+    kptr="$(sysctl -n kernel.kptr_restrict 2>/dev/null || true)"
+    syncookies="$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || true)"
+    if [[ "$kptr" == "0" ]]; then
+        review "kernel.kptr_restrict=0: kernel pointer restriction is disabled."
+        echo "  If the challenge expects hardening, investigate: sudo sysctl -w kernel.kptr_restrict=1"
+        echo "  Persist only after confirmation, e.g. a dedicated file in /etc/sysctl.d/."
+    elif [[ -n "$kptr" ]]; then ok "kernel.kptr_restrict=$kptr"; fi
+    if [[ "$syncookies" == "0" ]]; then
+        review "net.ipv4.tcp_syncookies=0: TCP SYN cookies are disabled."
+        echo "  If required by the challenge, investigate: sudo sysctl -w net.ipv4.tcp_syncookies=1"
+        echo "  Persist only after confirmation, e.g. a dedicated file in /etc/sysctl.d/."
+    elif [[ -n "$syncookies" ]]; then ok "net.ipv4.tcp_syncookies=$syncookies"; fi
+fi
+
+# FTP and web services need image-specific review; do not remove automatically.
+for unit in vsftpd apache2 nginx; do
+    if has systemctl && systemctl list-unit-files "${unit}.service" --no-legend 2>/dev/null | grep -q "${unit}.service"; then
+        if systemctl is-active --quiet "$unit"; then
+            review "$unit is installed and active. Confirm it is required by the challenge."
+        else
+            info "$unit is installed but not currently active; confirm whether it is required or prohibited."
+        fi
+    fi
+done
+
+# Flag MP3s separately, including items still in Trash.
+if [[ -d /home ]]; then
+    mp3s="$(find /home -type f -iname '*.mp3' -print 2>/dev/null || true)"
+    if [[ -n "$mp3s" ]]; then
+        review "MP3 files exist under /home; check whether the challenge explicitly prohibits them:"
+        printf '%s\n' "$mp3s" | sed 's/^/  /'
+        echo "  Trash is not the same as secure deletion; do not remove unless instructed."
+    else
+        ok "No MP3 files found under /home."
+    fi
+fi
+
+# Explain dpkg verification's config-file marker.
+if has dpkg; then
+    verify_config="$(dpkg --verify 2>/dev/null | awk '$2 == "c" {print}')"
+    if [[ -n "$verify_config" ]]; then
+        review "Package-managed configuration files differ from package checksums:"
+        printf '%s\n' "$verify_config" | sed 's/^/  /'
+        echo "  This can be normal after configuration changes; inspect each file's contents and history."
+    fi
+fi
+
+# 15. Human checklist
+section "[15] HUMAN REVIEW CHECKLIST"
 cat <<'EOF'
 Use the challenge instructions, if available, to determine:
 
@@ -321,3 +393,5 @@ echo "Finished: $(date)"
 echo "Report saved to: $REPORT"
 ok "Read-only audit finished. No system settings were changed."
 info "Review every [REVIEW] and [CHECK] item against the challenge requirements."
+info "To read the saved report without terminal scrolling: sudo less '$REPORT'"
+info "To search findings in the report: sudo grep -nE '\[(CHECK|REVIEW)\]' '$REPORT'"
