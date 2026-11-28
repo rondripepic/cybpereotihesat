@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CyberPatriot Guided Audit — Debian 12
-# Read-only: does not install/remove packages or change system settings.
+# Audit is read-only by default. Remediation is opt-in and interactive.
 # Run: sudo bash goon.sh
 # Findings are potential issues; compare them with the challenge instructions.
 
@@ -9,8 +9,10 @@ export LC_ALL=C
 
 NAME="${0##*/}"
 STAMP="$(date '+%Y-%m-%d_%H-%M-%S')"
+MODE=audit
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then REPORT_DIR=/root; else REPORT_DIR="${HOME:-/tmp}"; fi
 REPORT="${REPORT_DIR}/cyberpatriot-audit-${STAMP}.txt"
+SYSCTL_DROPIN=/etc/sysctl.d/99-cyberpatriot-guided.conf
 
 if [[ -t 1 ]]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
@@ -26,21 +28,185 @@ check()   { printf '%s[CHECK]%s %s\n' "$RED" "$RESET" "$*"; }
 section() { printf '\n============================================================\n%s\n============================================================\n' "$1"; }
 has()     { command -v "$1" >/dev/null 2>&1; }
 
+confirm() {
+    local answer
+    printf '%s [type yes to confirm]: ' "$1"
+    IFS= read -r answer || return 1
+    [[ "$answer" == yes ]]
+}
+
+backup_file() {
+    local source="$1" backup_dir="/root/cyberpatriot-backups/$STAMP"
+    mkdir -p -m 700 -- "$backup_dir" || {
+        check "Could not create backup directory: $backup_dir"
+        return 1
+    }
+    chmod 700 -- "$backup_dir" || return 1
+    cp -a -- "$source" "$backup_dir/" || {
+        check "Could not back up $source; it was not changed."
+        return 1
+    }
+    info "Backup created: $backup_dir/${source##*/}"
+}
+
+persist_sysctl() {
+    local key="$1" value="$2" tmp existing
+    if [[ -e "$SYSCTL_DROPIN" ]]; then
+        if ! grep -q '^# Managed by CyberPatriot Guided Audit$' "$SYSCTL_DROPIN"; then
+            review "$SYSCTL_DROPIN already exists and is not managed by this script; it was not changed."
+            return 1
+        fi
+        existing="$(grep -Ev '^[[:space:]]*(#|$)|^(kernel\.kptr_restrict|net\.ipv4\.tcp_syncookies)[[:space:]]*=[[:space:]]*[01][[:space:]]*$' "$SYSCTL_DROPIN" || true)"
+        if [[ -n "$existing" ]]; then
+            review "$SYSCTL_DROPIN contains unexpected content; it was not changed."
+            return 1
+        fi
+        if grep -Eq "^${key}[[:space:]]*=[[:space:]]*${value}[[:space:]]*$" "$SYSCTL_DROPIN"; then
+            ok "$key=$value is already persistent in $SYSCTL_DROPIN."
+            return 0
+        fi
+        if grep -Eq "^${key}[[:space:]]*=" "$SYSCTL_DROPIN"; then
+            review "$SYSCTL_DROPIN already sets $key differently; it was not changed."
+            return 1
+        fi
+        backup_file "$SYSCTL_DROPIN" || return 1
+        tmp="$(mktemp /etc/sysctl.d/.cyberpatriot-guided.XXXXXX)" || return 1
+        if ! cp -a -- "$SYSCTL_DROPIN" "$tmp" || ! printf '%s=%s\n' "$key" "$value" >> "$tmp"; then
+            rm -f -- "$tmp"
+            check "Could not prepare the persistent setting; $SYSCTL_DROPIN was not changed."
+            return 1
+        fi
+        if ! mv -f -- "$tmp" "$SYSCTL_DROPIN"; then
+            rm -f -- "$tmp"
+            check "Could not update $SYSCTL_DROPIN."
+            return 1
+        fi
+    else
+        tmp="$(mktemp /etc/sysctl.d/.cyberpatriot-guided.XXXXXX)" || return 1
+        if ! printf '# Managed by CyberPatriot Guided Audit\n%s=%s\n' "$key" "$value" > "$tmp" ||
+            ! chmod 644 -- "$tmp" || ! ln -- "$tmp" "$SYSCTL_DROPIN"; then
+            rm -f -- "$tmp"
+            check "Could not create $SYSCTL_DROPIN; no existing file was overwritten."
+            return 1
+        fi
+        rm -f -- "$tmp"
+    fi
+    ok "$key=$value will persist in $SYSCTL_DROPIN."
+}
+
+remediate_sysctl() {
+    local key="$1" label="$2" current
+    current="$(sysctl -n "$key" 2>/dev/null)" || {
+        check "Could not read $key; no change made."
+        return
+    }
+    if [[ "$current" == 1 ]]; then
+        ok "$key is already set to 1."
+        return
+    fi
+    review "$label: current value is $current; proposed value is 1."
+    if ! confirm "Apply $key=1 for this session?"; then
+        info "Skipped $key."
+        return
+    fi
+    if ! sysctl -w "$key=1"; then
+        check "Could not apply $key=1."
+        return
+    fi
+    if confirm "Also persist $key=1 across reboots?"; then
+        persist_sysctl "$key" 1 || review "The runtime value changed, but persistence was not configured."
+    else
+        info "$key=1 applies to this session only."
+    fi
+}
+
+remediate_shadow() {
+    local mode owner_group mode_num
+    if [[ ! -e /etc/shadow ]]; then
+        review "/etc/shadow is absent; no change made."
+        return
+    fi
+    mode="$(stat -c '%a' /etc/shadow 2>/dev/null)" || {
+        check "Could not inspect /etc/shadow; no change made."
+        return
+    }
+    owner_group="$(stat -c '%U:%G' /etc/shadow 2>/dev/null)" || return
+    if [[ "$owner_group" != root:shadow ]]; then
+        review "/etc/shadow is owned by $owner_group, not root:shadow; manual review required."
+        return
+    fi
+    if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        check "Could not parse /etc/shadow permissions: $mode"
+        return
+    fi
+    mode_num=$((8#$mode))
+    if (( (mode_num & 0004) == 0 && (mode_num & 0020) == 0 && (mode_num & 0002) == 0 )); then
+        ok "/etc/shadow permissions are not world-readable or group/world-writable ($mode)."
+        return
+    fi
+    review "Proposed change: chmod 640 /etc/shadow (currently $mode $owner_group)."
+    if ! confirm "Set /etc/shadow permissions to 640?"; then
+        info "Skipped /etc/shadow."
+        return
+    fi
+    if chmod 640 -- /etc/shadow; then
+        ok "/etc/shadow permissions are now $(stat -c '%a' /etc/shadow)."
+    else
+        check "Could not change /etc/shadow permissions."
+    fi
+}
+
+remediation_menu() {
+    local choice
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        check "Remediation requires root. Rerun with: sudo bash $NAME --remediate"
+        return 1
+    fi
+    if [[ ! -t 0 ]]; then
+        check "Remediation requires an interactive terminal; no changes made."
+        return 1
+    fi
+    section "INTERACTIVE REMEDIATION"
+    echo "Only explicitly selected actions are offered. Check each against the challenge requirements."
+    while true; do
+        cat <<'EOF'
+  1) Set /etc/shadow permissions to 640 (only if owned by root:shadow)
+  2) Set kernel.kptr_restrict=1 (runtime; persistence optional)
+  3) Set net.ipv4.tcp_syncookies=1 (runtime; persistence optional)
+  0) Exit
+EOF
+        printf 'Select an action: '
+        IFS= read -r choice || break
+        case "$choice" in
+            1) remediate_shadow ;;
+            2) remediate_sysctl kernel.kptr_restrict "Kernel pointer restriction is disabled" ;;
+            3) remediate_sysctl net.ipv4.tcp_syncookies "TCP SYN cookies are disabled" ;;
+            0) break ;;
+            *) review "Invalid selection." ;;
+        esac
+    done
+}
+
 case "${1:-}" in
-    "")
-        ;;
+    "") ;;
+    --audit) MODE=audit ;;
+    --recommend) MODE=recommend ;;
+    --remediate) MODE=remediate ;;
     -h|--help)
         cat <<EOF
-$NAME — CyberPatriot guided, read-only audit
+$NAME — CyberPatriot guided audit
 
 Usage:
-  sudo bash $NAME
-  bash $NAME
+  sudo bash $NAME [--audit|--recommend|--remediate]
+  bash $NAME [--audit|--recommend]
 
-Checks common Linux security areas and writes a timestamped report.
-It does NOT change settings, install software, delete accounts, or
-decide which users/services/files are authorized. Run with sudo for
-the most complete results.
+--audit       Inspect the system without changing settings (default).
+--recommend   Audit and show suggested actions; does not change settings.
+--remediate   Audit, then offer a confirmation-based menu of limited fixes.
+              Requires root and an interactive terminal.
+
+All modes write a timestamped report. Remediation never edits LightDM
+configuration, installs/removes packages, or deletes users/files.
 EOF
         exit 0
         ;;
@@ -49,6 +215,17 @@ EOF
         exit 2
         ;;
 esac
+
+if [[ "$MODE" == remediate ]]; then
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        printf 'Remediation requires root. Rerun with: sudo bash %s --remediate\n' "$NAME" >&2
+        exit 2
+    fi
+    if [[ ! -t 0 ]]; then
+        echo "Remediation requires an interactive terminal; no changes made." >&2
+        exit 2
+    fi
+fi
 
 if ! touch "$REPORT" 2>/dev/null; then
     REPORT="/tmp/cyberpatriot-audit-${STAMP}.txt"
@@ -59,6 +236,7 @@ exec > >(tee -a "$REPORT") 2>&1
 echo "CYBERPATRIOT GUIDED AUDIT"
 echo "Started: $(date)"
 echo "Report:  $REPORT"
+echo "Mode:    $MODE"
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     review "Not running as root; some checks may be incomplete. Run: sudo bash $NAME"
 else
@@ -368,6 +546,12 @@ if has dpkg; then
         echo "  This can be normal after configuration changes; inspect each file's contents and history."
     fi
 fi
+if [[ -r /etc/lightdm/lightdm.conf ]]; then
+    section "LIGHTDM CONFIGURATION (READ-ONLY INSPECTION)"
+    echo "/etc/lightdm/lightdm.conf, first 160 lines:"
+    sed -n '1,160p' /etc/lightdm/lightdm.conf | sed 's/^/  /'
+    echo "A checksum difference is not proof of a problem. No LightDM setting is changed by this script."
+fi
 
 # 15. Human checklist
 section "[15] HUMAN REVIEW CHECKLIST"
@@ -388,10 +572,22 @@ Use the challenge instructions, if available, to determine:
 Generic security advice is not a substitute for the image's requirements.
 EOF
 
+remediation_status=0
+if [[ "$MODE" == remediate ]]; then
+    remediation_menu || remediation_status=$?
+fi
+
 section "AUDIT COMPLETE"
 echo "Finished: $(date)"
 echo "Report saved to: $REPORT"
-ok "Read-only audit finished. No system settings were changed."
+if [[ "$MODE" == remediate ]]; then
+    info "Audit and selected remediation actions are recorded in the report."
+    info "Any persistent sysctl changes are in $SYSCTL_DROPIN."
+    info "Backups of modified sysctl drop-ins are stored under /root/cyberpatriot-backups/."
+else
+    ok "Read-only audit finished. No system settings were changed."
+fi
 info "Review every [REVIEW] and [CHECK] item against the challenge requirements."
 info "To read the saved report without terminal scrolling: sudo less '$REPORT'"
 info "To search findings in the report: sudo grep -nE '\[(CHECK|REVIEW)\]' '$REPORT'"
+exit "$remediation_status"
